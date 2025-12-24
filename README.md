@@ -1,5 +1,9 @@
 # SimulStreaming
 
+
+`container run --rm -it -v $(pwd)/models:/app/models -m 16G -p 9001:43007 whisper-streaming python simulstreaming_whisper_server.py --model_path models/small --warmup-file ./models/output.mp3 --host 0.0.0.0`
+
+
 SimulStreaming implements Whisper model for translation and transcription in
 simultaneous mode (which is known as *streaming* in the ASR community).
 SimulStreaming uses the state-of-the-art simultaneous policy AlignAtt, which

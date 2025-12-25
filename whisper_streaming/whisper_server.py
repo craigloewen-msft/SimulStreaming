@@ -7,6 +7,7 @@ import os
 import logging
 import numpy as np
 import asyncio
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +29,13 @@ class Connection:
         self.websocket = websocket
         self.last_line = ""
 
-    async def send(self, line):
-        '''it doesn't send the same line twice, because it was problematic in online-text-flow-events'''
-        if line == self.last_line:
+    async def send(self, event_data):
+        '''Send structured event data as JSON'''
+        json_str = json.dumps(event_data)
+        if json_str == self.last_line:
             return
-        await self.websocket.send_text(line)
-        self.last_line = line
+        await self.websocket.send_text(json_str)
+        self.last_line = json_str
 
     async def receive_lines(self):
         message = await self.websocket.receive_text()
@@ -41,8 +43,14 @@ class Connection:
 
     async def non_blocking_receive_audio(self):
         try:
-            data = await self.websocket.receive_bytes()
-            return data
+            # Receive JSON event with audio data and id
+            message = await self.websocket.receive_text()
+            event_data = json.loads(message)
+            # Extract audio bytes from the event (base64 encoded)
+            import base64
+            audio_bytes = base64.b64decode(event_data.get('audio', ''))
+            segment_id = event_data.get('id', None)
+            return (audio_bytes, segment_id)
         except WebSocketDisconnect:
             return None
         except Exception as e:
@@ -63,6 +71,7 @@ class ServerProcessor:
         self.min_chunk = min_chunk
 
         self.is_first = True
+        self.current_id = None
 
     async def receive_audio_chunk(self):
         # receive all audio that is available by this time
@@ -71,9 +80,13 @@ class ServerProcessor:
         out = []
         minlimit = self.min_chunk*SAMPLING_RATE
         while sum(len(x) for x in out) < minlimit:
-            raw_bytes = await self.connection.non_blocking_receive_audio()
-            if not raw_bytes:
+            result = await self.connection.non_blocking_receive_audio()
+            if not result:
                 break
+            raw_bytes, segment_id = result
+            # Update current_id with the most recent chunk's id
+            if segment_id is not None:
+                self.current_id = segment_id
 #            print("received audio:",len(raw_bytes), "bytes", raw_bytes[:10])
             sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1,endian="LITTLE",samplerate=SAMPLING_RATE, subtype="PCM_16",format="RAW")
             audio, _ = librosa.load(sf,sr=SAMPLING_RATE,dtype=np.float32)
@@ -87,17 +100,30 @@ class ServerProcessor:
         return np.concatenate(out)
 
     async def send_result(self, iteration_output):
-        # output format in stdout is like:
-        # 0 1720 Takhle to je
-        # - the first two words are:
-        #    - beg and end timestamp of the text segment, as estimated by Whisper model. The timestamps are not accurate, but they're useful anyway
-        # - the next words: segment transcript
+        # Send structured event with id, start, end, and text
+        # Always send an event, even if text is empty
         if iteration_output:
-            message = "%1.0f %1.0f %s" % (iteration_output['start'] * 1000, iteration_output['end'] * 1000, iteration_output['text'])
+            event = {
+                'type': 'transcription',
+                'id': self.current_id,
+                'start': iteration_output['start'] * 1000,  # Convert to milliseconds
+                'end': iteration_output['end'] * 1000,
+                'text': iteration_output['text']
+            }
+            message = "%1.0f %1.0f %s" % (event['start'], event['end'], event['text'])
             print(message, flush=True, file=sys.stderr)
-            await self.connection.send(message)
         else:
-            logger.debug("No text in this segment")
+            # Send empty event when no text is available
+            event = {
+                'type': 'transcription',
+                'id': self.current_id,
+                'start': 0,
+                'end': 0,
+                'text': ''
+            }
+            logger.debug("No text in this segment - sending empty event")
+        
+        await self.connection.send(event)
 
     async def process(self):
         # handle one client connection
